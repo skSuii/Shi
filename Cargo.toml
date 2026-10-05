@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+eframe = "0.36"
+egui = "0.36"
+cadrs = { package = "Cadrs", path = "sdk", default-features = false, features = [
+    "geometry",
+    "math",
+    "data_structure",
+] }
+serde_json = "1"
+rfd = "0.15"
+
+# 让依赖以优化模式编译，界面运行更流畅
+[profile.dev.package."*"]
+opt-level = 2
