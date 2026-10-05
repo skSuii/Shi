@@ -258,6 +258,8 @@ pub struct App {
     // 标注草稿：线性/角度标注拾取点；半径/直径标注目标 (圆心, 半径)
     dim_pts: Vec<Point>,
     radial_target: Option<(Point, f64)>,
+    // 拾取阶段光标下可标注的圆 / 圆弧（悬停高亮与光标提示用）
+    radial_hover: Option<ObjectId>,
     // 编辑变换拾取点
     edit_pts: Vec<Point>,
     // 框选起点（屏幕坐标）
@@ -304,6 +306,7 @@ impl App {
             ellipse_major: None,
             dim_pts: Vec::new(),
             radial_target: None,
+            radial_hover: None,
             edit_pts: Vec::new(),
             band_start: None,
             hover_world: None,
@@ -495,6 +498,19 @@ impl App {
         self.grid_size.max(1e-3)
     }
 
+    /// 当前是否处于「半径/直径标注放置文字」阶段。
+    ///
+    /// 该阶段光标决定标注方向，必须使用原始光标坐标，不能走对象捕捉：
+    /// 圆心吸附半径 14px 在圆内覆盖很大范围，会把方向钉死，导致标注无法按需放置。
+    fn placing_radial_text(&self) -> bool {
+        matches!(self.tool, Tool::DimRadial | Tool::DimDiameter) && self.radial_target.is_some()
+    }
+
+    /// 当前工具是否启用对象捕捉
+    fn osnap_active(&self) -> bool {
+        self.osnap_enabled && self.tool != Tool::Select && !self.placing_radial_text()
+    }
+
     fn finish_polyline(&mut self, closed: bool) {
         let t = self.t();
         if self.poly_pts.len() >= 2 {
@@ -530,6 +546,37 @@ impl App {
         self.history.push(HistoryOp::Added(entity.clone()));
         self.doc.add_entity(entity);
         self.set_status(msg.to_string());
+    }
+
+    /// 放置半径 / 直径标注：`aim` 为第二次单击的光标世界坐标，决定标注方向。
+    ///
+    /// 方向不可用（光标几乎落在圆心上，例如对象捕捉把点吸附到圆心）时返回 `false`
+    /// 并保留 `radial_target`，等待用户移到圆外重新单击，避免生成退化的标注。
+    fn place_radial_dimension(
+        &mut self,
+        center: Point,
+        radius: f64,
+        aim: Point,
+        is_diameter: bool,
+    ) -> bool {
+        let t = self.t();
+        if center.distance_to(&aim) < radius * 0.05 {
+            self.set_status(t.s_dim_place_far);
+            return false;
+        }
+        let Some(entity) = dim::make_radial(center, radius, aim, is_diameter, self.dim_text_height())
+        else {
+            self.set_status(t.s_dim_place_far);
+            return false;
+        };
+        self.radial_target = None;
+        let msg = if is_diameter {
+            t.s_add_dim_diameter
+        } else {
+            t.s_add_dim_radius
+        };
+        self.add_entity(entity, msg);
+        true
     }
 
     fn delete_selected(&mut self) {
@@ -990,6 +1037,60 @@ impl App {
         best.map(|(_, id)| id)
     }
 
+    /// 半径 / 直径标注的目标拾取：轮廓 8px 容差，整圆内部同样命中。
+    ///
+    /// 比 [`App::pick_entity`] 宽容：标注工具必须让"点圆内 / 点轮廓"都能选中目标，
+    /// 否则用户点圆内部毫无反应，看起来就像工具坏了。
+    fn radial_pick(&self, cursor: Pos2, rect: Rect) -> Option<ObjectId> {
+        const OUTLINE_TOL: f32 = 8.0;
+        let mut best: Option<(f32, ObjectId)> = None;
+        for (id, entity) in self.doc.entities() {
+            if !self.entity_interactable(entity) {
+                continue;
+            }
+            let (center, radius) = match entity.geometry() {
+                EntityGeometry::Circle(c) => (c.center, c.radius),
+                EntityGeometry::Arc(a) => (a.center, a.radius),
+                _ => continue,
+            };
+            // 到轮廓的屏幕距离
+            let mut min_d = f32::INFINITY;
+            for (pts, closed) in tess::entity_polylines(entity) {
+                let n = pts.len();
+                if n < 2 {
+                    continue;
+                }
+                let scr: Vec<Pos2> =
+                    pts.iter().map(|p| self.world_to_screen(*p, rect)).collect();
+                for i in 0..n - 1 {
+                    min_d = min_d.min(dist_point_to_segment(cursor, scr[i], scr[i + 1]));
+                }
+                if closed {
+                    min_d = min_d.min(dist_point_to_segment(cursor, scr[n - 1], scr[0]));
+                }
+            }
+            let score = if min_d <= OUTLINE_TOL {
+                // 轮廓命中优先
+                min_d
+            } else if matches!(entity.geometry(), EntityGeometry::Circle(_)) {
+                // 整圆：光标落在圆内也命中；嵌套圆取屏幕半径最小者
+                let cs = self.world_to_screen(center, rect);
+                let rs = (radius * self.zoom) as f32;
+                if rs > 0.0 && cursor.distance(cs) <= rs {
+                    OUTLINE_TOL + 1.0 + rs
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+            if best.as_ref().map_or(true, |(bd, _)| score < *bd) {
+                best = Some((score, id.clone()));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// 框选：实体任一顶点落在矩形内或任一线段与矩形相交即选中
     fn pick_entities_rect(&self, band: Rect, rect: Rect) -> Vec<ObjectId> {
         let mut hits = Vec::new();
@@ -1033,9 +1134,29 @@ impl App {
             .or_else(|| response.interact_pointer_pos());
         self.hover_world = pointer_pos.map(|p| self.screen_to_world(p, rect));
 
-        // 对象捕捉（绘图/编辑工具）
+        // 半径/直径标注：拾取阶段记录光标下的圆 / 圆弧，用于高亮与光标提示
+        self.radial_hover = if matches!(self.tool, Tool::DimRadial | Tool::DimDiameter)
+            && self.radial_target.is_none()
+        {
+            pointer_pos.and_then(|p| self.radial_pick(p, rect))
+        } else {
+            None
+        };
+
+        // 光标反馈：绘图 / 标注工具为十字；半径/直径标注命中圆/圆弧时变为手型
+        if response.hovered() {
+            if self.radial_hover.is_some() {
+                response
+                    .ctx
+                    .set_cursor_icon(egui::CursorIcon::PointingHand);
+            } else if self.tool != Tool::Select {
+                response.ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+
+        // 对象捕捉（绘图/编辑工具；半径/直径标注放置阶段除外，见 osnap_active）
         self.active_snap = None;
-        if self.osnap_enabled && self.tool != Tool::Select {
+        if self.osnap_active() {
             if let Some(pos) = pointer_pos {
                 self.active_snap = self.compute_osnap(pos, rect);
             }
@@ -1095,7 +1216,7 @@ impl App {
             }
         }
 
-        let Some(pos) = response.interact_pointer_pos() else {
+        let Some(pos) = response.hover_pos().or_else(|| response.interact_pointer_pos()) else {
             return;
         };
         let t = self.t();
@@ -1334,22 +1455,15 @@ impl App {
                 if response.clicked_by(egui::PointerButton::Primary) {
                     match self.radial_target {
                         Some((center, radius)) => {
-                            self.radial_target = None;
-                            let aim = self.snapped_world(pos, rect);
-                            if let Some(entity) = dim::make_radial(
-                                center,
-                                radius,
-                                aim,
-                                self.tool == Tool::DimDiameter,
-                                self.dim_text_height(),
-                            ) {
-                                self.add_entity(entity, t.s_add_dim);
-                            }
+                            // 放置阶段：直接用光标世界坐标（不吸附），保证方向可控
+                            let aim = self.screen_to_world(pos, rect);
+                            let is_diameter = self.tool == Tool::DimDiameter;
+                            self.place_radial_dimension(center, radius, aim, is_diameter);
                         }
                         None => {
-                            // 在光标附近找圆 / 圆弧
+                            // 在光标附近找圆 / 圆弧（轮廓容差，整圆内部同样命中）
                             let target = self
-                                .pick_entity(pos, rect)
+                                .radial_pick(pos, rect)
                                 .and_then(|id| self.doc.get_entity(&id))
                                 .and_then(|e| match e.geometry() {
                                     EntityGeometry::Circle(c) => Some((c.center, c.radius)),
@@ -1357,7 +1471,11 @@ impl App {
                                     _ => None,
                                 });
                             match target {
-                                Some(tr) => self.radial_target = Some(tr),
+                                Some(tr) => {
+                                    self.radial_target = Some(tr);
+                                    self.radial_hover = None;
+                                    self.set_status(t.s_dim_picked_circle);
+                                }
                                 None => self.set_status(t.s_need_circle),
                             }
                         }
@@ -1912,15 +2030,69 @@ impl App {
             Tool::DimRadial | Tool::DimDiameter => {
                 if let Some((center, radius)) = self.radial_target {
                     paint_marker(painter, self.world_to_screen(center, rect), ACCENT, 6.0);
-                    if let Some(hv) = snapped_hover {
+                    // 目标圆/圆弧高亮 + 方向引导线。
+                    // 放置阶段（radial_target 已确定）关闭了对象捕捉，因此预览必须使用
+                    // 原始光标坐标 hover_world，否则悬停时不会显示预览。
+                    let dir = self.hover_world;
+                    let circle_pts = tess::circle_points(center, radius, 72);
+                    let scr: Vec<Pos2> = circle_pts
+                        .iter()
+                        .map(|p| self.world_to_screen(*p, rect))
+                        .collect();
+                    paint_polyline(painter, &scr, true, Stroke::new(1.0, HINT_COLOR));
+                    if let Some(dir) = dir {
+                        painter.line_segment(
+                            [
+                                self.world_to_screen(center, rect),
+                                self.world_to_screen(dir, rect),
+                            ],
+                            Stroke::new(1.0, HINT_COLOR),
+                        );
                         if let Some(entity) = dim::make_radial(
                             center,
                             radius,
-                            hv,
+                            dir,
                             self.tool == Tool::DimDiameter,
                             dim_h,
                         ) {
                             self.paint_entity_preview(painter, &entity, rect);
+                        }
+                    }
+                } else if let Some(hover) = self.radial_hover.as_ref() {
+                    // 拾取阶段：高亮光标下的圆 / 圆弧 + 圆心标记 + R/Ø 徽标，
+                    // 让用户在单击之前就能看到"这里可以标注"。
+                    if let Some(entity) = self.doc.get_entity(hover) {
+                        for (pts, closed) in tess::entity_polylines(entity) {
+                            if pts.len() < 2 {
+                                continue;
+                            }
+                            let scr: Vec<Pos2> =
+                                pts.iter().map(|p| self.world_to_screen(*p, rect)).collect();
+                            paint_polyline(painter, &scr, closed, Stroke::new(2.0, ACCENT));
+                        }
+                        let center = match entity.geometry() {
+                            EntityGeometry::Circle(c) => Some(c.center),
+                            EntityGeometry::Arc(a) => Some(a.center),
+                            _ => None,
+                        };
+                        if let Some(center) = center {
+                            paint_marker(painter, self.world_to_screen(center, rect), ACCENT, 5.0);
+                        }
+                        // 徽标跟随光标，提示当前工具的标注类型
+                        if let Some(hv) = self.hover_world {
+                            let badge = if self.tool == Tool::DimDiameter { "Ø" } else { "R" };
+                            let anchor = self.screen_to_world(
+                                self.world_to_screen(hv, rect) + Vec2::new(14.0, -6.0),
+                                rect,
+                            );
+                            for (pts, _) in dim::text_strokes(badge, anchor, dim_h * 0.9, 0.0) {
+                                if pts.len() < 2 {
+                                    continue;
+                                }
+                                let scr: Vec<Pos2> =
+                                    pts.iter().map(|p| self.world_to_screen(*p, rect)).collect();
+                                paint_polyline(painter, &scr, false, Stroke::new(1.5, ACCENT));
+                            }
                         }
                     }
                 }
@@ -2064,15 +2236,11 @@ impl App {
             let t = self.t();
             let has_sel = !self.selected.is_empty();
             response.context_menu(|ui| {
-                if ui.button(t.mi_undo).clicked() {
-                    self.undo();
-                    ui.close();
-                }
                 if ui
-                    .add_enabled(self.history.can_redo(), egui::Button::new(t.mi_redo))
+                    .add_enabled(self.history.can_undo(), egui::Button::new(t.mi_undo))
                     .clicked()
                 {
-                    self.redo();
+                    self.undo();
                     ui.close();
                 }
                 if ui
@@ -2510,9 +2678,17 @@ impl App {
                 );
             }
             ui.separator();
-            // 编辑工具但无选区时提示先选择对象
+            // 编辑工具但无选区、或标注已选目标时给出对应的分步提示
             let hint = if self.tool.is_edit() && n == 0 {
                 t.s_none_selected
+            } else if matches!(self.tool, Tool::DimRadial | Tool::DimDiameter)
+                && self.radial_target.is_some()
+            {
+                t.s_dim_picked_circle
+            } else if matches!(self.tool, Tool::DimRadial | Tool::DimDiameter)
+                && self.radial_hover.is_some()
+            {
+                t.s_dim_hover_circle
             } else {
                 self.tool.hint(t)
             };
@@ -2702,5 +2878,385 @@ impl eframe::App for App {
         });
 
         self.ui_windows(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadrs::data_structure::{make_arc, make_circle, make_line};
+
+    /// 构造一个不依赖 egui 上下文的 App，用于测试标注等纯逻辑
+    fn test_app() -> App {
+        let doc = Document::new("test".to_string());
+        let current_layer = doc.model_space().clone();
+        App {
+            doc,
+            lang: Lang::Zh,
+            tool: Tool::DimRadial,
+            line_start: None,
+            poly_pts: Vec::new(),
+            circle_center: None,
+            arc_center: None,
+            arc_start: None,
+            rect_corner: None,
+            ellipse_center: None,
+            ellipse_major: None,
+            dim_pts: Vec::new(),
+            radial_target: None,
+            radial_hover: None,
+            edit_pts: Vec::new(),
+            band_start: None,
+            hover_world: None,
+            active_snap: None,
+            selected: SelectionSet::new(),
+            history: OpHistory::new(),
+            pan: Vec2::new(-100.0, -80.0),
+            zoom: 2.0,
+            grid_visible: true,
+            snap_enabled: true,
+            osnap_enabled: true,
+            grid_size: 10.0,
+            current_layer,
+            show_layers: false,
+            fill_color: [86, 156, 214],
+            file_path: None,
+            pending_fit: false,
+            pending_zoom: None,
+            status: String::new(),
+            show_about: false,
+            show_shortcuts: false,
+        }
+    }
+
+    fn dim_entities(app: &App) -> Vec<&Entity> {
+        app.doc
+            .entities()
+            .values()
+            .filter(|e| matches!(e.geometry(), EntityGeometry::Dimension { .. }))
+            .collect()
+    }
+
+    // ---------- 半径 / 直径标注 ----------
+
+    #[test]
+    fn place_radial_dimension_creates_entity() {
+        let mut app = test_app();
+        let center = Point::new2d(50.0, 50.0);
+        assert!(app.place_radial_dimension(center, 10.0, Point::new2d(60.0, 50.0), false));
+        assert_eq!(dim_entities(&app).len(), 1);
+        assert!(app.radial_target.is_none(), "放置成功后应清空目标");
+        let e = dim_entities(&app)[0];
+        match e.geometry() {
+            EntityGeometry::Dimension { dim_type, measurement, .. } => {
+                assert_eq!(*dim_type, cadrs::data_structure::DimensionType::Radius);
+                assert!((*measurement - 10.0).abs() < 1e-9);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn place_diameter_dimension_creates_entity() {
+        let mut app = test_app();
+        app.tool = Tool::DimDiameter;
+        assert!(app.place_radial_dimension(Point::origin(), 4.0, Point::new2d(0.0, 4.0), true));
+        let dims = dim_entities(&app);
+        assert_eq!(dims.len(), 1);
+        match dims[0].geometry() {
+            EntityGeometry::Dimension { dim_type, text, measurement, .. } => {
+                assert_eq!(*dim_type, cadrs::data_structure::DimensionType::Diameter);
+                assert!((*measurement - 8.0).abs() < 1e-9);
+                assert!(text.starts_with('Ø'), "直径标注文字应带 Ø 前缀，实际 {text}");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// 回归：光标被对象捕捉吸附到圆心时，方向不可用 → 不生成退化标注，
+    /// 且保留目标，允许用户移到圆外重新单击。
+    #[test]
+    fn place_radial_dimension_rejects_aim_on_center() {
+        let mut app = test_app();
+        let center = Point::new2d(20.0, 20.0);
+        app.radial_target = Some((center, 30.0));
+        assert!(!app.place_radial_dimension(center, 30.0, center, false));
+        assert!(dim_entities(&app).is_empty(), "不应生成退化标注");
+        assert!(app.radial_target.is_some(), "方向无效时应保留目标");
+    }
+
+    #[test]
+    fn place_radial_dimension_accepts_all_directions() {
+        let center = Point::origin();
+        let radius = 5.0;
+        for aim in [
+            Point::new2d(5.0, 0.0),
+            Point::new2d(-5.0, 0.0),
+            Point::new2d(0.0, 5.0),
+            Point::new2d(0.0, -5.0),
+            Point::new2d(3.5, 3.5),
+        ] {
+            let mut app = test_app();
+            assert!(
+                app.place_radial_dimension(center, radius, aim, false),
+                "方向 {aim:?} 应可放置"
+            );
+            assert_eq!(dim_entities(&app).len(), 1);
+        }
+    }
+
+    #[test]
+    fn place_radial_dimension_uses_raw_cursor_not_snap() {
+        // 第二次单击必须使用原始光标坐标：即使存在圆心捕捉，标注方向也应跟随光标
+        let mut app = test_app();
+        app.active_snap = Some((Point::origin(), SnapKind::Center));
+        let center = Point::origin();
+        let cursor_world = Point::new2d(0.0, 20.0);
+        let aim = app.screen_to_world(app.world_to_screen(cursor_world, test_rect()), test_rect());
+        assert!(app.place_radial_dimension(center, 10.0, aim, false));
+        let dims = dim_entities(&app);
+        assert_eq!(dims.len(), 1);
+        match dims[0].geometry() {
+            EntityGeometry::Dimension { def_point_2, .. } => {
+                assert!(
+                    def_point_2.distance_to(&Point::new2d(0.0, 10.0)) < 1e-6,
+                    "标注点应落在 +y 方向，实际 {def_point_2:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn test_rect() -> Rect {
+        Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0))
+    }
+
+    // ---------- 坐标变换 ----------
+
+    #[test]
+    fn screen_world_roundtrip() {
+        let app = test_app();
+        let rect = test_rect();
+        for p in [
+            Point::new2d(0.0, 0.0),
+            Point::new2d(123.5, -45.25),
+            Point::new2d(-1000.0, 2000.0),
+        ] {
+            let back = app.screen_to_world(app.world_to_screen(p, rect), rect);
+            assert!(back.distance_to(&p) < 1e-3, "{p:?} → {back:?}");
+        }
+    }
+
+    #[test]
+    fn grid_snap_rounds_to_step() {
+        let app = test_app();
+        let snapped = app.snap(Point::new2d(12.0, -18.0));
+        assert!((snapped.x - 10.0).abs() < 1e-9);
+        assert!((snapped.y + 20.0).abs() < 1e-9);
+    }
+
+    // ---------- 拾取 ----------
+
+    #[test]
+    fn pick_entity_finds_circle_and_arc() {
+        let mut app = test_app();
+        let rect = test_rect();
+        let circle = make_circle(Point::new2d(0.0, 0.0), 50.0);
+        let circle_id = app.doc.add_entity(circle);
+        let arc = make_arc(Point::new2d(200.0, 0.0), 40.0, 0.0, std::f64::consts::FRAC_PI_2);
+        let arc_id = app.doc.add_entity(arc);
+        let line = make_line(Point::new2d(-300.0, 0.0), Point::new2d(-200.0, 0.0));
+        let line_id = app.doc.add_entity(line);
+
+        // 圆上一点（+x 象限点）
+        let on_circle = app.world_to_screen(Point::new2d(50.0, 0.0), rect);
+        assert_eq!(app.pick_entity(on_circle, rect).as_ref(), Some(&circle_id));
+
+        // 圆弧起点
+        let on_arc = app.world_to_screen(Point::new2d(240.0, 0.0), rect);
+        assert_eq!(app.pick_entity(on_arc, rect).as_ref(), Some(&arc_id));
+
+        // 直线端点
+        let on_line = app.world_to_screen(Point::new2d(-250.0, 0.0), rect);
+        assert_eq!(app.pick_entity(on_line, rect).as_ref(), Some(&line_id));
+
+        // 空白处不应命中
+        let empty = app.world_to_screen(Point::new2d(600.0, 600.0), rect);
+        assert!(app.pick_entity(empty, rect).is_none());
+    }
+
+    #[test]
+    fn pick_entity_skips_locked_layer() {
+        let mut app = test_app();
+        let rect = test_rect();
+        // 与 App::add_entity 一致：实体归属当前图层
+        let layer_id = app.current_layer.clone();
+        let mut circle = make_circle(Point::origin(), 50.0);
+        circle.layer_id = layer_id.clone();
+        let id = app.doc.add_entity(circle);
+        let on_circle = app.world_to_screen(Point::new2d(50.0, 0.0), rect);
+        assert_eq!(app.pick_entity(on_circle, rect).as_ref(), Some(&id));
+
+        // 锁定图层后不可拾取（但仍可见）
+        let mut info = layers::read(app.doc.get_layer(&layer_id).unwrap());
+        info.locked = true;
+        layers::write(app.doc.layers_mut().get_mut(&layer_id).unwrap(), &info);
+        let layer = app.doc.get_layer(&layer_id).unwrap();
+        assert!(layer.is_visible() && layer.is_locked());
+        assert!(app.pick_entity(on_circle, rect).is_none());
+
+        // 隐藏图层同样不可拾取
+        info.locked = false;
+        info.visible = false;
+        layers::write(app.doc.layers_mut().get_mut(&layer_id).unwrap(), &info);
+        assert!(app.pick_entity(on_circle, rect).is_none());
+    }
+
+    // ---------- 半径 / 直径标注的悬停拾取 ----------
+
+    /// 轮廓与圆内部都能命中；圆外与非圆实体不命中。
+    ///
+    /// 回归：旧实现只沿轮廓 8px 拾取，点圆内部毫无反应，用户以为标注工具坏了。
+    #[test]
+    fn radial_pick_hits_outline_and_interior() {
+        let mut app = test_app();
+        let rect = test_rect();
+        let circle_id = app.doc.add_entity(make_circle(Point::origin(), 50.0));
+        let _line_id = app
+            .doc
+            .add_entity(make_line(Point::new2d(-300.0, 0.0), Point::new2d(-200.0, 0.0)));
+
+        // 轮廓上的一点
+        let on_outline = app.world_to_screen(Point::new2d(50.0, 0.0), rect);
+        assert_eq!(app.radial_pick(on_outline, rect).as_ref(), Some(&circle_id));
+
+        // 圆心
+        let at_center = app.world_to_screen(Point::origin(), rect);
+        assert_eq!(app.radial_pick(at_center, rect).as_ref(), Some(&circle_id));
+
+        // 圆内部任意点
+        let inside = app.world_to_screen(Point::new2d(-30.0, 20.0), rect);
+        assert_eq!(app.radial_pick(inside, rect).as_ref(), Some(&circle_id));
+
+        // 圆外空白
+        let empty = app.world_to_screen(Point::new2d(0.0, 200.0), rect);
+        assert!(app.radial_pick(empty, rect).is_none());
+
+        // 直线不是标注目标
+        let on_line = app.world_to_screen(Point::new2d(-250.0, 0.0), rect);
+        assert!(app.radial_pick(on_line, rect).is_none());
+    }
+
+    /// 嵌套圆：轮廓命中优先；都在圆内时取屏幕半径最小者
+    #[test]
+    fn radial_pick_prefers_outline_then_smallest_circle() {
+        let mut app = test_app();
+        let rect = test_rect();
+        let big = app.doc.add_entity(make_circle(Point::origin(), 200.0));
+        let small = app.doc.add_entity(make_circle(Point::origin(), 50.0));
+
+        let on_small = app.world_to_screen(Point::new2d(50.0, 0.0), rect);
+        assert_eq!(app.radial_pick(on_small, rect).as_ref(), Some(&small));
+
+        let at_center = app.world_to_screen(Point::origin(), rect);
+        assert_eq!(app.radial_pick(at_center, rect).as_ref(), Some(&small));
+
+        let in_big = app.world_to_screen(Point::new2d(120.0, 0.0), rect);
+        assert_eq!(app.radial_pick(in_big, rect).as_ref(), Some(&big));
+    }
+
+    /// 圆弧只在弧线附近命中（圆弧没有"内部"命中）
+    #[test]
+    fn radial_pick_finds_arc_outline_only() {
+        let mut app = test_app();
+        let rect = test_rect();
+        let arc_id = app.doc.add_entity(make_arc(
+            Point::new2d(200.0, 0.0),
+            40.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ));
+
+        let on_arc = app.world_to_screen(Point::new2d(240.0, 0.0), rect);
+        assert_eq!(app.radial_pick(on_arc, rect).as_ref(), Some(&arc_id));
+
+        // 同半径的对侧点不在弧上
+        let opposite = app.world_to_screen(Point::new2d(160.0, 0.0), rect);
+        assert!(app.radial_pick(opposite, rect).is_none());
+    }
+
+    /// 锁定 / 隐藏图层上的圆不可作为标注目标
+    #[test]
+    fn radial_pick_skips_locked_layer() {
+        let mut app = test_app();
+        let rect = test_rect();
+        let layer_id = app.current_layer.clone();
+        let mut circle = make_circle(Point::origin(), 50.0);
+        circle.layer_id = layer_id.clone();
+        let id = app.doc.add_entity(circle);
+        let at_center = app.world_to_screen(Point::origin(), rect);
+        assert_eq!(app.radial_pick(at_center, rect).as_ref(), Some(&id));
+
+        let mut info = layers::read(app.doc.get_layer(&layer_id).unwrap());
+        info.locked = true;
+        layers::write(app.doc.layers_mut().get_mut(&layer_id).unwrap(), &info);
+        assert!(app.radial_pick(at_center, rect).is_none());
+
+        info.locked = false;
+        info.visible = false;
+        layers::write(app.doc.layers_mut().get_mut(&layer_id).unwrap(), &info);
+        assert!(app.radial_pick(at_center, rect).is_none());
+    }
+
+    // ---------- 草稿状态 ----------
+
+    #[test]
+    fn draft_cancel_clears_radial_target() {
+        let mut app = test_app();
+        app.radial_target = Some((Point::origin(), 5.0));
+        assert!(app.has_draft());
+        app.cancel_draft();
+        assert!(!app.has_draft());
+        assert!(app.radial_target.is_none());
+    }
+
+    /// 回归：半径/直径标注「选定圆 → 放置文字」两个阶段的捕捉策略。
+    ///
+    /// 第一阶段允许对象捕捉（便于选中圆/圆弧所在位置），
+    /// 第二阶段必须关闭捕捉，否则光标会被圆心吸附、方向无法指定。
+    #[test]
+    fn osnap_disabled_only_while_placing_radial_text() {
+        let mut app = test_app();
+        app.osnap_enabled = true;
+
+        // 半径标注：未选目标 → 允许捕捉
+        app.tool = Tool::DimRadial;
+        app.radial_target = None;
+        assert!(app.placing_radial_text() == false);
+        assert!(app.osnap_active());
+
+        // 半径标注：已选目标 → 关闭捕捉
+        app.radial_target = Some((Point::origin(), 20.0));
+        assert!(app.placing_radial_text());
+        assert!(!app.osnap_active());
+
+        // 直径标注同样处理
+        app.tool = Tool::DimDiameter;
+        assert!(!app.osnap_active());
+
+        // 放置完成后恢复捕捉
+        app.radial_target = None;
+        assert!(app.osnap_active());
+
+        // 其他工具不受影响
+        app.tool = Tool::Line;
+        assert!(app.osnap_active());
+        app.tool = Tool::Select;
+        assert!(!app.osnap_active(), "Select 工具不使用对象捕捉");
+
+        // 用户关闭对象捕捉时始终不启用
+        app.tool = Tool::DimRadial;
+        app.osnap_enabled = false;
+        assert!(!app.osnap_active());
     }
 }
